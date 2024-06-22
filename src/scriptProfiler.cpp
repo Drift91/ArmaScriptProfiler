@@ -2,11 +2,16 @@
 #include <intercept.hpp>
 #include <numeric>
 #include <random>
+#include <filesystem>
+#include <fstream>
+#include <nlohmann/json.hpp>
 #ifndef __linux__
 #include <Windows.h>
 #else
 #include <signal.h>
-#include <fstream>
+#include <limits.h>
+#include <unistd.h>
+#include <link.h>
 #endif
 #include "ProfilerAdapter.hpp"
 #include "AdapterArmaDiag.hpp"
@@ -25,7 +30,8 @@
 using namespace intercept;
 using namespace std::chrono_literals;
 std::chrono::high_resolution_clock::time_point startTime;
-static sqf_script_type GameDataProfileScope_type;
+static sqf_script_type* GameDataProfileScope_type;
+static nlohmann::json json;
 
 scriptProfiler profiler{};
 bool instructionLevelProfiling = false;
@@ -76,7 +82,7 @@ public:
     GameDataProfileScope() = default;
     GameDataProfileScope(std::shared_ptr<scopeData>&& _data) noexcept : data(std::move(_data)) {}
     void lastRefDeleted() const override { delete this; }
-    const sqf_script_type& type() const override { return GameDataProfileScope_type; }
+    const sqf_script_type& type() const override { return *GameDataProfileScope_type; }
     ~GameDataProfileScope() override = default;
     bool get_as_bool() const override { return true; }
     float get_as_number() const override { return 0.f; }
@@ -176,7 +182,7 @@ public:
         //    }
         //}
 
-        static r_string scp("1scp"sv);
+        static r_string scp("1scp"sv); //#TODO this crashes game at shutdown because it tries to deallocate
         state.set_local_variable(scp, game_value(new GameDataProfileScope(std::move(data))), false);
 
         //if (name == "CBA_fnc_compileFunction") {
@@ -352,7 +358,7 @@ game_value profileScript(game_state& state, game_value_parameter par) {
 }
 
 
-std::regex getScriptName_acefncRegex(R"(\\?[xz]\\([^\\]*)\\addons\\([^\\]*)\\(?:[^\\]*\\)*fnc?_([^.]*)\.sqf)", std::regex_constants::ECMAScript | std::regex_constants::optimize | std::regex_constants::icase);
+std::regex getScriptName_acefncRegex(R"(\\?(?:[xz]|idi)\\([^\\]*)\\addons\\([^\\]*)\\(?:[^\\]*\\)*fnc?_([^.]*)\.sqf)", std::regex_constants::ECMAScript | std::regex_constants::optimize | std::regex_constants::icase);
 std::regex getScriptName_aceMiscRegex(R"(\\?[xz]\\([^\\]*)\\addons\\([^\\]*)\\(?:[^\\]*\\)*([^.]*)\.sqf)", std::regex_constants::ECMAScript | std::regex_constants::optimize | std::regex_constants::icase);
 std::regex getScriptName_LinePreprocRegex(R"(#line [0-9]* (?:"|')([^"']*))", std::regex_constants::ECMAScript | std::regex_constants::optimize | std::regex_constants::icase);
 std::regex getScriptName_bisfncRegex(R"(\\?A3\\(?:[^.]*\\)+fn_([^.]*).sqf)", std::regex_constants::ECMAScript | std::regex_constants::optimize | std::regex_constants::icase);
@@ -425,7 +431,7 @@ std::string getScriptName(const r_string& str, const r_string& filePath, uint32_
     if (returnFirstLineIfNoName) {
         auto linebreak = str.find("\n", 0);
         if (linebreak < 20) {
-            auto linebreak2 = str.find("\n", linebreak);
+            auto linebreak2 = str.find("\n", linebreak + 1);
             if (linebreak2 > linebreak) linebreak = linebreak2;
         }
         if (linebreak != -1) {
@@ -596,6 +602,16 @@ public:
     r_string get_name() const override { return ""sv; }
 };
 
+bool codeHasScopeInstruction(const auto_array<ref<game_instruction>>& bodyCode)
+{
+    if (bodyCode.empty()) return false;
+
+    auto lt = typeid(*bodyCode.front().getRef()).hash_code();
+    auto rt = typeid(GameInstructionProfileScopeStart).hash_code();
+
+    return lt == rt;
+}
+
 void addScopeInstruction(auto_array<ref<game_instruction>>& bodyCode, const r_string& scriptName) {
 #ifndef __linux__
 #ifndef _WIN64
@@ -603,11 +619,7 @@ void addScopeInstruction(auto_array<ref<game_instruction>>& bodyCode, const r_st
 #endif
 #endif
     if (bodyCode.empty()) return;
-
-    auto lt = typeid(bodyCode.data()[0]).hash_code();
-    auto rt = typeid(GameInstructionProfileScopeStart).hash_code();
-
-    if (lt == rt) return;
+    if (codeHasScopeInstruction(bodyCode)) return;
     if (bodyCode.size() < 4) return;
 
 
@@ -668,12 +680,45 @@ std::optional<r_string> tryGetNameFromInitFunctions(game_state& state) {
     return fncname;
 }
 
+r_string getCallerSourceFile(const game_state& state) {
+    //return state.get_vm_context()->get_current_position().sourcefile; // This used to work, but now doesn't, just returns "CBA_fnc_preInit" even though we are in CBA_fnc_compileFinal
+
+    auto& cs = state.get_vm_context()->callstack;
+    if (cs.empty()) return {};
+    auto x1 = typeid(*cs.back().get()).raw_name();
+    if (typeid(*cs.back().get()).hash_code() != 0x6a5a9847820cfc77) return {}; // callstackitemdata
+    const auto& code = static_cast<vm_context::callstack_item_data*>(cs.back().get())->_code;
+    if (!code) return {};
+    if (code->instructions.empty()) return {};
+    return code->instructions.front()->sdp->sourcefile;
+}
+
 std::optional<r_string> tryGetNameFromCBACompile(game_state& state) {
     const std::string cbaCompile_Path(R"(\x\cba\addons\xeh\fnc_compileFunction.sqf)");
-    if (state.get_vm_context()->get_current_position().sourcefile.find(cbaCompile_Path) != 0) return {};
+    const std::string cbaCompile_PathB(R"(/x/cba/addons/xeh/fnc_compileFunction.sqf)"); // ArmaScriptCompiler does forward slashes instead (to be fixed there soonish)
+    const auto sFilePath = getCallerSourceFile(state);
+    if (sFilePath.empty()) return {};
+
+    if (getCallerSourceFile(state).find(sFilePath.front() == '/' ? cbaCompile_PathB : cbaCompile_Path) != 0) return {};
     r_string fncname = state.get_local_variable("_funcname"sv);
     return fncname;
 }
+
+bool hasCBA = false;
+
+std::optional<r_string> tryGetNameFromCBACompileFinal(game_state& state) {
+    const std::string cbaCompile_Path(R"(\x\cba\addons\common\fnc_compileFinal.sqf)");
+    const std::string cbaCompile_PathB(R"(/x/cba/addons/common/fnc_compileFinal.sqf)"); // ArmaScriptCompiler does forward slashes instead (to be fixed there soonish)
+    const auto sFilePath = getCallerSourceFile(state);
+    if (sFilePath.empty()) return {};
+
+    if (getCallerSourceFile(state).find(sFilePath.front() == '/' ? cbaCompile_PathB : cbaCompile_Path) != 0) return {};
+    hasCBA = true; // I only need this for OnFrame handler, and that one always goes through here
+    r_string fncname = state.get_local_variable("_name"sv);
+    return fncname;
+}
+
+unary_function compileFinal214 = nullptr; // #TODO get rid of this at 2.14 release
 
 game_value compileRedirect2(game_state& state, game_value_parameter message) {
     if (!profiler.compileScope) {
@@ -711,6 +756,38 @@ game_value compileRedirect2(game_state& state, game_value_parameter message) {
     if (bodyCode->instructions.size() > 4 && !scriptName.empty())// && scriptName != "<unknown>"
         addScopeInstruction(bodyCode->instructions, scriptName);
 
+    // HACK: CBA's OnFrame function is not a standalone function that has "compile" called on it, it is just a member variable in a function.
+    // So we use this hack here to find it
+    // Cheap size check first, string compare on every compile is meh
+    //if (funcPath.capacity() == 45 && funcPath == R"(x\cba\addons\common\init_perFrameHandler.sqf)")
+    //{
+    //    // Find the first constant instruction that pushes a piece of code, that's our OnFrame code.
+    //
+    //    for (auto& game_instruction : bodyCode->instructions)
+    //    {
+    //        if (typeid(*game_instruction.getRef()).hash_code() != 0x0a56f03038a03360)
+    //            continue;
+    //        auto* constant = static_cast<game_instruction_constant*>(game_instruction.getRef());
+    //        if (constant->value.type_enum() != game_data_type::CODE)
+    //            continue;
+    //
+    //        // First code constant, this should be it
+    //
+    //        //{
+    //        //    auto subBodyCode = static_cast<game_data_code*>(constant->value.data.get());
+    //        //    r_string funcName = "CBA_PFH_OnFrame";
+    //        //    addScopeInstruction(subBodyCode->instructions, funcName);
+    //        //
+    //        //    // HACK2, because old CBA (pre 2.14) recompiles this string while stripping all file location info (and our profiling scope), we also need to inject a manual scripted scope into it.
+    //        //
+    //        //    subBodyCode->code_string = "scriptName \"CBA_PFH_OnFrame\";" + subBodyCode->code_string;
+    //        //    __nop();
+    //        //}
+    //    }
+    //
+    //}
+
+
     return comp;
 }
 
@@ -723,35 +800,52 @@ game_value compileRedirectFinal(game_state& state, game_value_parameter message)
 
     auto tempData = GProfilerAdapter->enterScope(profiler.compileScope);
 
-    r_string str = message;
+    r_string bodyString;
+    game_data_code* bodyCode;
+    game_value resultValue = message;
+    if (message.type_enum() == game_data_type::STRING) {
 
-    auto comp = sqf::compile_final(str);
-    auto bodyCode = static_cast<game_data_code*>(comp.data.get());
-    if (bodyCode->instructions.empty()) {
-        GProfilerAdapter->leaveScope(tempData);
-        return comp;
-    }
+        bodyString = message;
+
+        auto comp = resultValue = sqf::compile_final(bodyString);
+        bodyCode = static_cast<game_data_code*>(comp.data.get());
+        if (bodyCode->instructions.empty()) {
+            GProfilerAdapter->leaveScope(tempData);
+            return comp;
+        }
 
 #ifdef WITH_BROFILER
-    if (auto brofilerData = std::dynamic_pointer_cast<ScopeTempStorageBrofiler>(tempData)) {
-        r_string src = getScriptFromFirstLine(bodyCode->instructions->front()->sdp, false);
-        brofilerData->evtDt->sourceCode = src;
-    }
+        if (auto brofilerData = std::dynamic_pointer_cast<ScopeTempStorageBrofiler>(tempData)) {
+            r_string src = getScriptFromFirstLine(bodyCode->instructions->front()->sdp, false);
+            brofilerData->evtDt->sourceCode = src;
+        }
 #endif
 
-    GProfilerAdapter->leaveScope(tempData);
+        GProfilerAdapter->leaveScope(tempData);
+
+    } else if (message.type_enum() == game_data_type::CODE) {
+        //#TODO call the function directly once this was fixed with 2.14 release
+        resultValue = host::functions.invoke_raw_unary(compileFinal214, message);
+
+        bodyCode = static_cast<game_data_code*>(resultValue.data.get());
+        bodyString = bodyCode->code_string;
+    } else {
+        //#TODO call the function directly once this was fixed with 2.14 release
+        return host::functions.invoke_raw_unary(compileFinal214, message);
+    }
+
 
     auto& funcPath = bodyCode->instructions.front()->sdp->sourcefile;
 
     auto scriptName = tryGetNameFromInitFunctions(state);
-    if (!scriptName) scriptName = tryGetNameFromCBACompile(state);
-    if (!scriptName) scriptName = getScriptName(str, funcPath, 32);
+    if (!scriptName) scriptName = tryGetNameFromCBACompileFinal(state);
+    if (!scriptName) scriptName = getScriptName(bodyString, funcPath, 32);
     //if (scriptName.empty()) scriptName = "<unknown>";
 
-    if (bodyCode->instructions.size() > 4 && scriptName && !scriptName->empty())// && scriptName != "<unknown>"
+    if (bodyCode->instructions.size() > 3 && scriptName && !scriptName->empty())// && scriptName != "<unknown>"
         addScopeInstruction(bodyCode->instructions, *scriptName);
 
-    return comp;
+    return resultValue;
 }
 
 game_value callExtensionRedirect(game_state&, game_value_parameter ext, game_value_parameter msg) {
@@ -818,7 +912,7 @@ game_value compileScriptRedirect(game_state& state, game_value_parameter message
     auto tempData = GProfilerAdapter->enterScope(profiler.compileScriptScope);
     GProfilerAdapter->setName(tempData, "compileScript " + static_cast<r_string>(message[0]));
 
-    r_string str = message;
+    auto& args = message.to_array();
 
     auto comp = host::functions.invoke_raw_unary(compileScriptFunc, message);
     auto bodyCode = static_cast<game_data_code*>(comp.data.get());
@@ -836,14 +930,30 @@ game_value compileScriptRedirect(game_state& state, game_value_parameter message
 
     GProfilerAdapter->leaveScope(tempData);
 
-    auto& funcPath = bodyCode->instructions.front()->sdp->sourcefile;
+    auto& funcPath = args[0];
     //#TODO pass instructions to getScriptName and check if there is a "scriptName" or "scopeName" unary command call
-    r_string scriptName(getScriptName(str, funcPath, 32));
+
+    std::optional<r_string> scriptName;
+    if (args.size() > 2) {
+        auto scrNamePrefixHeader = getScriptName(args[2], funcPath, 32);
+        if (scrNamePrefixHeader != "<unknown>")
+            scriptName = scrNamePrefixHeader;
+    }
+
+
+    if (!scriptName) scriptName = tryGetNameFromCBACompile(state);
+
+    if (!scriptName)
+    {
+        // Load file contents and see if we can grab name from there
+        auto scriptContents = sqf::preprocess_file_line_numbers(args[0]);
+        scriptName = getScriptName(scriptContents, funcPath, 32);
+    };
 
     //if (scriptName.empty()) scriptName = "<unknown>";
 
-    if (bodyCode->instructions.size() > 4 && !scriptName.empty())// && scriptName != "<unknown>"
-        addScopeInstruction(bodyCode->instructions, scriptName);
+    if (bodyCode->instructions.size() > 3 && scriptName)// && scriptName != "<unknown>"
+        addScopeInstruction(bodyCode->instructions, *scriptName);
 
     return comp;
 }
@@ -882,6 +992,25 @@ std::optional<std::string> getCommandLineParam(std::string_view needle) {
         if (adapterStr.back() == '"')
             adapterStr = adapterStr.substr(0, adapterStr.length() - 1);
         return adapterStr;
+    }
+
+    if (!json.empty() && json.contains(needle.substr(1))) {
+        switch (json[needle.substr(1)].type()) {
+            case nlohmann::json::value_t::boolean:
+            {
+                if (json[needle.substr(1)].get<bool>()) {
+                    return "true";
+                } else {
+                    return {};
+                }
+            }
+            case nlohmann::json::value_t::string:
+            {
+                return json[needle.substr(1)].get<std::string>();
+            }
+            default:
+                return {};
+        }
     }
     return {};
 }
@@ -1202,8 +1331,71 @@ public:
 
 #pragma endregion Instructions
 #endif
+
+
+#if __linux__
+extern "C" int iterateCallback(struct dl_phdr_info* info, size_t size, void* data) {
+    std::filesystem::path sharedPath = info->dlpi_name;
+    if (sharedPath.filename() == "ArmaScriptProfiler_x64.so") {
+        *static_cast<std::filesystem::path*>(data) = info->dlpi_name;
+        return 0;
+    }
+    return 0;
+}
+#endif
+
+std::filesystem::path getSharedObjectPath() {
+#if __linux__
+    std::filesystem::path path;
+    dl_iterate_phdr(iterateCallback, &path);
+    return path;
+
+#else
+    wchar_t buffer[MAX_PATH] = { 0 };
+    HMODULE handle = nullptr;
+    if(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&getSharedObjectPath), &handle) == 0) {
+        sqf::diag_log("getSharedObjectPath: GetModuleHandle failed");
+        return std::filesystem::path{};
+    }
+
+    DWORD len = GetModuleFileNameW(handle, buffer, MAX_PATH);
+    if (len == 0) {
+        return std::filesystem::path{};
+    }
+    return std::filesystem::path{buffer};
+#endif
+}
+
+std::filesystem::path findConfigFilePath() {
+
+    std::filesystem::path path = getSharedObjectPath();
+    path = path.parent_path().parent_path();
+
+    std::filesystem::path dirName{ "config"sv };
+    std::filesystem::path fileName{ "parameters.json"sv };
+    path = path / dirName / fileName;
+
+    return path;
+}
+
 void scriptProfiler::preStart() {
     sqf::diag_log("Arma Script Profiler preStart");
+
+    std::filesystem::path filePath = findConfigFilePath();
+    
+    if (!filePath.empty() && std::filesystem::exists(filePath)) {
+        sqf::diag_log("ASP: Found a Configuration File"sv);
+        std::ifstream file(filePath);
+        try {
+            json = nlohmann::json::parse(file);
+        }
+        catch (nlohmann::json::exception& error) {
+            // log error, set parameterFile false, and continue by using getCommandLineParam
+            sqf::diag_log(error.what());
+             
+        }
+    }
 
     auto startAdapter = getCommandLineParam("-profilerAdapter"sv);
 
@@ -1215,7 +1407,6 @@ void scriptProfiler::preStart() {
             auto chromeAdapter = std::make_shared<AdapterChrome>();
             GProfilerAdapter = chromeAdapter;
             sqf::diag_log("ASP: Selected Chrome Adapter"sv);
-
             auto chromeOutput = getCommandLineParam("-profilerOutput"sv);
             if (chromeOutput)
                 chromeAdapter->setTargetFile(*chromeOutput);
@@ -1314,7 +1505,7 @@ void scriptProfiler::preStart() {
     static auto _profilerSetCounter = client::host::register_sqf_command("profilerSetCounter", "Set's a counter value", profilerSetCounter, game_data_type::NOTHING, game_data_type::STRING, game_data_type::SCALAR);
     static auto _profilerTime = client::host::register_sqf_command("profilerTime", "Returns the time since gamestart as [seconds, microseconds, nanoseconds]"sv, profilerTime, game_data_type::ARRAY);
 
-
+    compileFinal214 = (unary_function)host::functions.get_unary_function_typed("compilefinal"sv, "CODE"sv); //#TODO get rid at 2.14 release
 
     auto compHookDisabled = client::host::request_plugin_interface("ProfilerNoCompile", 1); //ASM will call us via interface instead
 
@@ -1322,7 +1513,7 @@ void scriptProfiler::preStart() {
         static auto _profilerCompile = client::host::register_sqf_command("compile", "Profiler redirect", compileRedirect2, game_data_type::CODE, game_data_type::STRING);
         //static auto _profilerCompile2 = client::host::register_sqf_command("compile2", "Profiler redirect", compileRedirect, game_data_type::CODE, game_data_type::STRING);
         //static auto _profilerCompile3 = client::host::register_sqf_command("compile3", "Profiler redirect", compileRedirect2, game_data_type::CODE, game_data_type::STRING);
-        static auto _profilerCompileF = client::host::register_sqf_command("compileFinal", "Profiler redirect", compileRedirectFinal, game_data_type::CODE, game_data_type::STRING);
+        static auto _profilerCompileF = client::host::register_sqf_command("compileFinal", "Profiler redirect", compileRedirectFinal, game_data_type::CODE, game_data_type::CODE);
 
 
         compileScriptFunc = (unary_function)host::functions.get_unary_function_typed("compilescript"sv, "ARRAY"sv);
@@ -1492,6 +1683,141 @@ void scriptProfiler::perFrame() {
         }
         waitForAdapter.clear();
     }
+
+
+    // Try to keep CBA PFH's updated
+
+    if (hasCBA)
+    {
+        for (auto pfhEntry : intercept::sqf::get_variable(intercept::sqf::mission_namespace(), "cba_common_perFrameHandlerArray").to_array())
+        {
+            auto pfhEntryArray = pfhEntry.to_array();
+            // https://github.com/CBATeam/CBA_A3/blob/263286f95453697bfb296937cb1a896c7885e682/addons/common/init_perFrameHandler.sqf#L32
+            // _x params ["_function", "_delay", "_delta", "", "_args", "_handle"];
+
+            if (pfhEntryArray.front().type_enum() != game_data_type::CODE)
+            {
+                // Something is fucked
+                hasCBA = false;
+                break;
+            }
+
+            auto bodyCode = static_cast<game_data_code*>(pfhEntryArray.front().data.get());
+            if (bodyCode->instructions.empty()) {
+                continue; // lol someone added a empty PFH?
+            }
+            if (codeHasScopeInstruction(bodyCode->instructions))
+                continue;
+
+            auto& funcPath = bodyCode->instructions.front()->sdp->sourcefile;
+            auto& str = bodyCode->code_string;
+            //#TODO pass instructions to getScriptName and check if there is a "scriptName" or "scopeName" unary command call
+            r_string scriptName(getScriptName(str, funcPath, 32));
+
+            //if (scriptName.empty()) scriptName = "<unknown>";
+
+            if (bodyCode->instructions.size() > 3 && !scriptName.empty())// && scriptName != "<unknown>"
+                addScopeInstruction(bodyCode->instructions, scriptName);
+        }
+
+
+        for (auto pfhEntry : intercept::sqf::get_variable(intercept::sqf::mission_namespace(), "cba_common_waitAndExecArray").to_array())
+        {
+            auto pfhEntryArray = pfhEntry.to_array();
+            // [time, func, args]
+
+            if (pfhEntryArray.size() != 3 || pfhEntryArray[1].type_enum() != game_data_type::CODE)
+            {
+                // Something is fucked
+                hasCBA = false;
+                break;
+            }
+
+            auto bodyCode = static_cast<game_data_code*>(pfhEntryArray[1].data.get());
+            if (bodyCode->instructions.empty()) {
+                continue; // lol someone added a empty PFH?
+            }
+            if (codeHasScopeInstruction(bodyCode->instructions))
+                continue;
+
+            auto& funcPath = bodyCode->instructions.front()->sdp->sourcefile;
+            auto& str = bodyCode->code_string;
+            //#TODO pass instructions to getScriptName and check if there is a "scriptName" or "scopeName" unary command call
+            r_string scriptName(getScriptName(str, funcPath, 32));
+
+            //if (scriptName.empty()) scriptName = "<unknown>";
+
+            if (bodyCode->instructions.size() > 3 && !scriptName.empty())// && scriptName != "<unknown>"
+                addScopeInstruction(bodyCode->instructions, scriptName);
+        }
+
+
+        for (auto pfhEntry : intercept::sqf::get_variable(intercept::sqf::mission_namespace(), "cba_common_nextFrameBufferA").to_array())
+        {
+            auto pfhEntryArray = pfhEntry.to_array();
+            // [args, code]
+
+            if (pfhEntryArray.size() != 2 || pfhEntryArray[1].type_enum() != game_data_type::CODE)
+            {
+                // Something is fucked
+                hasCBA = false;
+                break;
+            }
+
+            auto bodyCode = static_cast<game_data_code*>(pfhEntryArray[1].data.get());
+            if (bodyCode->instructions.empty()) {
+                continue; // lol someone added a empty PFH?
+            }
+            if (codeHasScopeInstruction(bodyCode->instructions))
+                continue;
+
+            auto& funcPath = bodyCode->instructions.front()->sdp->sourcefile;
+            auto& str = bodyCode->code_string;
+            //#TODO pass instructions to getScriptName and check if there is a "scriptName" or "scopeName" unary command call
+            r_string scriptName(getScriptName(str, funcPath, 32));
+
+            //if (scriptName.empty()) scriptName = "<unknown>";
+
+            if (bodyCode->instructions.size() > 3 && !scriptName.empty())// && scriptName != "<unknown>"
+                addScopeInstruction(bodyCode->instructions, scriptName);
+        }
+
+        for (auto pfhEntry : intercept::sqf::get_variable(intercept::sqf::mission_namespace(), "cba_common_waitUntilAndExecArray").to_array())
+        {
+            auto pfhEntryArray = pfhEntry.to_array();
+            // [condcode, actioncode, args]
+
+            if (pfhEntryArray.size() != 3 || pfhEntryArray[1].type_enum() != game_data_type::CODE || pfhEntryArray[0].type_enum() != game_data_type::CODE)
+            {
+                // Something is fucked
+                hasCBA = false;
+                break;
+            }
+
+            for(auto& cd : {pfhEntryArray[0], pfhEntryArray[1]})
+            {
+                auto bodyCode = static_cast<game_data_code*>(cd.data.get());
+                if (bodyCode->instructions.empty()) {
+                    continue; // lol someone added a empty PFH?
+                }
+                if (codeHasScopeInstruction(bodyCode->instructions))
+                    continue;
+
+                auto& funcPath = bodyCode->instructions.front()->sdp->sourcefile;
+                auto& str = bodyCode->code_string;
+                //#TODO pass instructions to getScriptName and check if there is a "scriptName" or "scopeName" unary command call
+                r_string scriptName(getScriptName(str, funcPath, 32));
+
+                //if (scriptName.empty()) scriptName = "<unknown>";
+
+                if (bodyCode->instructions.size() > 3 && !scriptName.empty())// && scriptName != "<unknown>"
+                    addScopeInstruction(bodyCode->instructions, scriptName);
+            }
+        }
+
+    }
+
+
 }
 
 void scriptProfiler::preInit() {
